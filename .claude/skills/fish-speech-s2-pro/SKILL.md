@@ -184,9 +184,9 @@ python examples/online_serving/text_to_speech/fish_speech/gradio_demo.py \
     --host 0.0.0.0
 ```
 
-Options: `--share` (public link), `--stream-chunk-seconds 0.5`.
+Flags: `--api-base`, `--host` (default `0.0.0.0`), `--port` (default `7860`).
 
-The demo supports text input, voice cloning (upload/microphone/URL), streaming toggle, and format selection.
+The demo supports text input, voice cloning (upload/microphone/URL), a streaming toggle, and format selection. Streaming uses a **same-origin FastAPI proxy** (`/proxy/v1/audio/speech`) feeding a **Web Audio API AudioWorklet** player for gap-free playback — this replaces gradio's built-in streaming `gr.Audio`, which has inherent inter-chunk gaps/clicks. When a stream finishes, the browser assembles the accumulated PCM into a WAV so the full clip stays playable and downloadable. Non-streaming still returns the full clip via `gr.Audio`.
 
 ## Key gotchas
 

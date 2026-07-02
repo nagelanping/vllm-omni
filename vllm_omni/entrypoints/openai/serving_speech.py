@@ -142,6 +142,31 @@ _TTS_LANGUAGES = frozenset(
         "Italian",
     }
 )
+# OpenAI TTS API preset voice names. Standard OpenAI TTS clients MUST send
+# ``voice``, and these are the only valid values in OpenAI's API.  Models
+# that support text-only synthesis (Fish Speech S2-Pro) accept these as
+# aliases for the default/text-only mode so that unmodified OpenAI SDK
+# clients can use the endpoint without errors.
+# Ref: https://developers.openai.com/api/docs/guides/text-to-speech
+_OPENAI_PRESET_VOICES: set[str] = {
+    # Original 6 (tts-1 / tts-1-hd)
+    "alloy",
+    "echo",
+    "fable",
+    "onyx",
+    "nova",
+    "shimmer",
+    # Newer voices (tts-1 / tts-1-hd and gpt-4o-mini-tts)
+    "ash",
+    "coral",
+    "sage",
+    # gpt-4o-mini-tts only
+    "ballad",
+    "verse",
+    # Recommended for best quality (gpt-4o-mini-tts)
+    "marin",
+    "cedar",
+}
 _REF_AUDIO_MIN_DURATION = 1.0  # seconds
 _REF_AUDIO_MAX_DURATION = 30.0  # seconds
 _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES = 256
@@ -1142,6 +1167,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         voice_lower = request.voice.lower()
         if voice_lower not in self.uploaded_speakers:
+            # OpenAI preset voices are required by the OpenAI TTS API spec.
+            # Fish Speech S2-Pro supports text-only synthesis without voice
+            # cloning, so accept these as aliases for the default mode.
+            if self._tts_model_type == "fish_tts" and voice_lower in _OPENAI_PRESET_VOICES:
+                logger.info(
+                    "OpenAI preset voice '%s' requested for Fish Speech; "
+                    "using text-only mode (no voice cloning). Upload a voice "
+                    "via POST /v1/audio/voices for custom voice output.",
+                    request.voice,
+                )
+                return None
             if self._tts_model_type in (
                 "cosyvoice3",
                 "fish_tts",
@@ -3559,6 +3595,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             tts_params = {}
             prompt = {"prompt": request.input}
 
+        # Reject requests whose estimated prompt length exceeds the TTS stage's
+        # max_model_len BEFORE handing them to the engine.  Without this guard,
+        # an overlong input silently hangs the engine until a client-side
+        # timeout (typically 90 s) with no actionable error.
+        tts_max_model_len: int | None = getattr(
+            getattr(self._tts_stage, "engine_args", None), "max_model_len", None
+        )
+        if tts_max_model_len is not None and isinstance(prompt, dict):
+            prompt_token_ids = prompt.get("prompt_token_ids")
+            if prompt_token_ids is not None and len(prompt_token_ids) > tts_max_model_len:
+                raise ValueError(
+                    f"Input too long: estimated prompt length is {len(prompt_token_ids)} tokens, "
+                    f"but the model's maximum context length is {tts_max_model_len} tokens. "
+                    f"Shorten the input text."
+                )
+
+        request_id = request_id or f"speech-{random_uuid()}"
         if self._tts_model_type == "step_audio2":
             model_type = "step_audio2"
         elif self._is_fish_speech:

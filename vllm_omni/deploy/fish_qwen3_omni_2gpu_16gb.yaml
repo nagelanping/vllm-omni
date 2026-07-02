@@ -1,6 +1,19 @@
-# Fish Speech S2 Pro 2×16GB VRAM 优化配置
+# Fish Speech S2 Pro 2-GPU deploy: 2x16G VRAM 优化版本
 #
-# Stage0 SlowAR on GPU0, Stage1 DAC on GPU1.
+# Fish Speech S2 Pro 2-GPU deploy: Stage0 AR on GPU 0, Stage1 DAC on GPU 1.
+#
+# Opt-in profile validated on H100x2. Compared with the single-GPU default
+# (``fish_qwen3_omni.yaml``), it splits AR and DAC across devices to remove
+# AR/DAC contention, enlarges Stage0 AR batching, and lets Stage1 consume
+# multiple DAC chunks in parallel.
+#
+# Select via:
+#   CUDA_VISIBLE_DEVICES=0,1 vllm serve fishaudio/s2-pro --omni \
+#       --deploy-config vllm_omni/deploy/fish_qwen3_omni_2gpu_16gb.yaml
+#
+# Or programmatically:
+#   Omni(model="fishaudio/s2-pro",
+#        deploy_config_path="vllm_omni/deploy/fish_qwen3_omni_2gpu_16gb.yaml")
 
 async_chunk: true
 enable_chunked_prefill: false
@@ -11,9 +24,12 @@ connectors:
     extra:
       shm_threshold_bytes: 65536
       codec_streaming: true
+      # Tightened from 10ms to 1ms: chunks become available sooner under
+      # cross-GPU pipelining, so connector idle waiting dominates if left high.
       connector_get_sleep_s: 0.001
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
+      # ~21 Hz codec; 25 frames ≈ 1.16s of audio.
       codec_chunk_frames: 25
       codec_left_context_frames: 25
       initial_codec_chunk_frames: 4
@@ -24,6 +40,8 @@ stages:
     gpu_memory_utilization: 0.85
     enforce_eager: false
     async_scheduling: false
+    # vLLM scheduler requires max_num_batched_tokens >= max_model_len when
+    # chunked prefill is off (SlowAR decode loop isn't chunked-prefill-safe).
     max_num_batched_tokens: 12288
     max_model_len: 12288
     devices: "0"
@@ -33,13 +51,13 @@ stages:
       temperature: 0.8
       top_k: 30
       top_p: 0.9
-      max_tokens: 65536
+      max_tokens: 12288
       seed: 42
       repetition_penalty: 1.0
 
   - stage_id: 1
     max_num_seqs: 64
-    gpu_memory_utilization: 0.25
+    gpu_memory_utilization: 0.2
     enforce_eager: true
     async_scheduling: false
     max_num_batched_tokens: 16384

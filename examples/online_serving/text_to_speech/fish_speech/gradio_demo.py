@@ -4,18 +4,19 @@ Streaming uses a custom AudioWorklet-based player for gap-free playback,
 inspired by github.com/KoljaB/RealtimeVoiceChat. Audio is streamed from the
 vLLM server through a same-origin proxy and played via the Web Audio API's
 AudioWorklet, which maintains a FIFO buffer queue and plays samples at the
-audio clock rate — eliminating the inter-chunk gaps and clicks inherent in
-Gradio's built-in streaming audio component.
-
-Non-streaming mode returns the full clip via gr.Audio (with download).
+audio clock rate — eliminating the inter-chunk gaps inherent in Gradio's
+built-in streaming audio component.
 
 Supports:
-  - Text-to-speech synthesis (random timbre, steer with inline [tag] control)
-  - Voice cloning from reference audio (upload, microphone, or URL)
+  - Text-to-speech synthesis
+  - Voice cloning from reference audio (upload or URL)
+  - Streaming (gapless AudioWorklet) and non-streaming modes
 
 Usage:
     # Start the server first (see run_server.sh), then:
     python gradio_demo.py --api-base http://localhost:8091
+
+    # Or use run_gradio_demo.sh to start both server and demo together.
 """
 
 import argparse
@@ -489,14 +490,14 @@ def create_app(api_base: str):
             with gr.Column(scale=3):
                 text_input = gr.Textbox(
                     label="Text to Synthesize",
-                    placeholder="Enter text here... Use inline [tag] control, e.g. [whispering] a secret.",
+                    placeholder="Enter text here...",
                     lines=4,
                 )
 
                 with gr.Accordion("Voice Cloning (optional)", open=False):
                     gr.Markdown(
                         "Upload or link a short reference audio (10-30s) and provide its transcript to clone the voice. "
-                        "Leave empty for random timbre; use English text tags like `[cool]`, `[warm]`, `[happy]` to steer the output."
+                        "Leave empty for random timbre; use text tags like `[cool]`, `[warm]`, `[happy]` to steer the output."
                     )
                     ref_audio = gr.Audio(
                         label="Reference Audio",
@@ -531,13 +532,10 @@ def create_app(api_base: str):
                 generate_btn = gr.Button("Generate Speech", variant="primary", size="lg")
 
             with gr.Column(scale=2):
-                # Streaming: gap-free AudioWorklet player (HTML). Non-streaming:
-                # standard gr.Audio with download. Only one is visible at a time.
                 player_html = gr.HTML(
                     value=PLAYER_HTML,
                     visible=False,
                     label="Streaming player",
-                    elem_id="streaming-player",
                 )
                 audio_output = gr.Audio(
                     label="Generated Audio",

@@ -3549,11 +3549,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # apply uploaded speakers inside validate(), which sets request.ref_audio
         # in place. The builders need to know whether the caller supplied audio
         # inline vs. via an uploaded voice.
+        model_type: str | None = None
         has_inline_ref_audio = request.ref_audio is not None
         if self._tts_model_type == "ming_flash_omni_tts":
             # ming_flash_omni is intentionally NOT migrated onto the adapter
             # framework in this PR (it has no registered adapter); keep it on the
             # legacy inline dispatch so serving still works.
+            model_type = "ming_flash_omni_tts"
             validation_error = self._validate_ming_flash_omni_tts_request(request)
             if validation_error:
                 raise ValueError(validation_error)
@@ -3567,6 +3569,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             prepared = await adapter.build(request, sampling_params_list, has_inline_ref_audio)
             prompt = prepared.prompt
             tts_params = prepared.tts_params
+            model_type = prepared.model_type
             qwen3_ref_audio_warmup_artifact_key = prepared.warmup_artifact_key
         else:
             # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"

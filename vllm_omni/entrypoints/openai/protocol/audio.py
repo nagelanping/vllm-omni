@@ -6,6 +6,10 @@ from pydantic import AliasChoices, BaseModel, Field, field_validator, model_vali
 
 _MAX_EMBEDDING_DIM = 8192
 
+SUPPORTED_AUDIO_FORMATS: frozenset[str] = frozenset({"wav", "pcm", "flac", "mp3", "opus"})
+SUPPORTED_CHAT_AUDIO_FORMATS: frozenset[str] = SUPPORTED_AUDIO_FORMATS | {"pcm16"}
+DEFAULT_AUDIO_FORMAT: str = "wav"
+
 
 def _normalize_ref_audio_value(value):
     if value is None:
@@ -55,11 +59,21 @@ class OpenAICreateSpeechRequest(BaseModel):
         validation_alias=AliasChoices("voice", "speaker"),
         description="Speaker/voice to use. For Qwen3-TTS: vivian, ryan, aiden, etc.",
     )
+
+    @field_validator("voice", mode="before")
+    @classmethod
+    def _normalize_voice(cls, voice: str | dict[str, str]) -> str:
+        if isinstance(voice, dict):
+            if "id" not in voice:
+                raise ValueError("voice dict must contain 'id'")
+            return voice["id"]
+        return voice
+
     instructions: str | None = Field(
         default=None,
         description="Instructions for voice style/emotion (maps to 'instruct' for Qwen3-TTS)",
     )
-    response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
+    response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
     speed: float | None = Field(
         default=1.0,
         ge=0.25,
@@ -78,7 +92,8 @@ class OpenAICreateSpeechRequest(BaseModel):
         description=(
             "Streaming switch; defaults to OpenAI speech.audio.* SSE events. "
             "Set stream_format='audio' to opt into raw pcm/wav byte streaming. "
-            "Requires response_format='pcm' or 'wav'. Speed adjustment is not supported when streaming."
+            "HTTP streaming requires response_format='pcm' or 'wav'. "
+            "Models with native speed control may accept speed adjustment over HTTP."
         ),
     )
 
@@ -156,10 +171,12 @@ class OpenAICreateSpeechRequest(BaseModel):
     word_timestamps: bool = Field(
         default=False,
         description=(
-            "When true, the server runs a shared forced aligner alongside the streamed "
-            "audio and emits per-chunk word timestamps. Requires the server to be "
-            "launched with --forced-aligner pointing at an aligner model. No effect "
-            "when streaming is off."
+            "When true, non-streaming responses carry per-word timestamps in the "
+            "X-Word-Timestamps header (JSON list of {word, start_ms, end_ms}, "
+            "ASCII-escaped; replaced by X-Word-Timestamps-Omitted past 4 KB). "
+            "Requires the server to be launched with --forced-aligner (400 otherwise). "
+            "Not supported with stream=true; for streaming use the WebSocket "
+            "/v1/audio/speech/stream path."
         ),
     )
 
@@ -313,8 +330,6 @@ class OpenAICreateSpeechRequest(BaseModel):
                 )
             if self.speed is None:
                 self.speed = 1.0
-            elif self.speed != 1.0:
-                raise ValueError("Speed adjustment is not supported when streaming. Set speed=1.0 or omit it.")
         return self
 
 
@@ -325,7 +340,7 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
         description="Text prompt describing the audio to generate",
     )
     model: str | None = None
-    response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
+    response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
     speed: float | None = Field(
         default=1.0,
         ge=0.25,
@@ -391,7 +406,7 @@ class SpeechBatchItem(BaseModel):
     input: str
     voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     instructions: str | None = None
-    response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] | None = None
+    response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] | None = None
     speed: float | None = Field(default=None, ge=0.25, le=4.0)
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None
@@ -411,7 +426,7 @@ class BatchSpeechRequest(BaseModel):
     items: list[SpeechBatchItem] = Field(..., min_length=1)
     voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     instructions: str | None = None
-    response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
+    response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
     speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None
@@ -500,13 +515,13 @@ class StreamingSpeechSessionConfig(BaseModel):
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None
     instructions: str | None = None
-    response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
+    response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
     speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
     max_new_tokens: int | None = Field(default=None, ge=1)
     initial_codec_chunk_frames: int | None = Field(
         default=None,
         ge=0,
-        description="Initial chunk size for reduced TTFA. Overrides stage config for this session.",
+        description="Initial chunk size for reduced TTFA. Overrides the deploy config for this session.",
     )
     non_streaming_mode: bool | None = Field(
         default=None,
@@ -528,7 +543,8 @@ class StreamingSpeechSessionConfig(BaseModel):
         default=False,
         description=(
             "If true, send raw PCM audio chunks progressively over WebSocket. "
-            "Requires response_format='pcm'. Speed adjustment is not supported when streaming."
+            "Requires response_format='pcm'. WebSocket streaming currently requires "
+            "speed=1.0, including for models with native speed control."
         ),
     )
     word_timestamps: bool = Field(
@@ -552,5 +568,8 @@ class StreamingSpeechSessionConfig(BaseModel):
             if self.speed is None:
                 self.speed = 1.0
             elif self.speed != 1.0:
-                raise ValueError("Speed adjustment is not supported when stream_audio=true. Set speed=1.0 or omit it.")
+                raise ValueError(
+                    "WebSocket stream_audio=true currently requires speed=1.0; "
+                    "native speed control is only available through HTTP streaming."
+                )
         return self

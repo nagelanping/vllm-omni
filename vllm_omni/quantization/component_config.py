@@ -29,6 +29,21 @@ if TYPE_CHECKING:
 PRE_QUANTIZED_METHODS: frozenset[str] = frozenset({"modelopt", "modelopt_fp4", "modelopt_mxfp8", "modelopt_mixed"})
 
 
+def resolve_component_quant_config(
+    quant_config: QuantizationConfig | None,
+    component: str,
+) -> QuantizationConfig | None:
+    """Resolve one pipeline component from a global or component config.
+
+    A plain config is global and therefore applies unchanged to every
+    quantization-aware component. Only ``ComponentQuantizationConfig`` narrows
+    the scope through its explicit prefix map.
+    """
+    if isinstance(quant_config, ComponentQuantizationConfig):
+        return quant_config.resolve(component)
+    return quant_config
+
+
 def resolve_encoder_quant_config(
     quant_config: QuantizationConfig | None,
 ) -> QuantizationConfig | None:
@@ -80,6 +95,7 @@ class ComponentQuantizationConfig(QuantizationConfig):
         component_configs: dict[str, QuantizationConfig | None],
         default_config: QuantizationConfig | None = None,
     ) -> None:
+        super().__init__()
         self._components = component_configs
         self._default = default_config
         self._sorted_prefixes = sorted(self._components.keys(), key=len, reverse=True)

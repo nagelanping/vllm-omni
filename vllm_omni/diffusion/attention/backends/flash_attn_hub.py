@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import threading
+from collections.abc import Callable
 from functools import partial
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
@@ -11,11 +14,40 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
-from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
-    piecewise_attn,
-)
+from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import piecewise_attn
 
 logger = init_logger(__name__)
+
+
+_hub_modules: dict[str, object] = {}
+_hub_lock = threading.Lock()
+
+
+def _load_hub_module(repo_id: str):
+    from kernels import get_kernel
+
+    logger.info("Loading %s kernel from HuggingFace Hub...", repo_id)
+    last_error = None
+    for version in (1, 2):
+        try:
+            return get_kernel(repo_id, version=version)
+        except Exception as exc:
+            logger.info("Failed to load %s version %s: %s", repo_id, version, exc)
+            last_error = exc
+    raise RuntimeError(f"Failed to load HuggingFace Hub kernel {repo_id!r}") from last_error
+
+
+def _get_hub_module(repo_id: str):
+    with _hub_lock:
+        if repo_id not in _hub_modules:
+            _hub_modules[repo_id] = _load_hub_module(repo_id)
+        return _hub_modules[repo_id]
+
+
+def _require_varlen_func(func: Callable[..., Any] | None) -> Callable[..., Any]:
+    if func is None:
+        raise RuntimeError("flash_attn_varlen_func is not available from the Hub kernel")
+    return func
 
 
 def _run_varlen_dense(
@@ -50,9 +82,11 @@ def _run_varlen_dense(
 
 class FlashAttentionHubBackend(AttentionBackend):
     accept_output_buffer: bool = True
+    supports_piecewise_spans: bool = True
 
     @classmethod
-    def supports_attention_mask(cls) -> bool:
+    def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
+        del attention_spec
         return True
 
     @staticmethod
@@ -68,7 +102,7 @@ class FlashAttentionHubBackend(AttentionBackend):
         return FlashAttentionHubImpl
 
 
-class FlashAttentionHubImpl(AttentionImpl):
+class FlashAttentionHubImpl(AttentionImpl[AttentionMetadata]):
     def __init__(
         self,
         num_heads: int,
@@ -88,23 +122,9 @@ class FlashAttentionHubImpl(AttentionImpl):
         if backend_kwargs:
             logger.warning("FlashAttentionHubImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
 
-        # Lazily get the kernel from the Hub to avoid network/disk overhead on import
-        from kernels import get_kernel
-
-        logger.info("Loading flash-attn2 kernel from HuggingFace Hub...")
-        try:
-            hub_module = get_kernel("kernels-community/flash-attn2", version=1)
-        except Exception as e:
-            try:
-                logger.info("Failed to load version 1, attempting version 2: %s", e)
-                hub_module = get_kernel("kernels-community/flash-attn2", version=2)
-            except Exception as e2:
-                logger.info("Failed to load version 2, attempting default: %s", e2)
-                hub_module = get_kernel("kernels-community/flash-attn2")
-
-        self.flash_attn_func = getattr(hub_module, "flash_attn_func", None)
-        self.flash_attn_varlen_func = getattr(hub_module, "flash_attn_varlen_func", None)
-
+        hub_module = _get_hub_module("kernels-community/flash-attn2")
+        self.flash_attn_func: Callable[..., Any] | None = getattr(hub_module, "flash_attn_func", None)
+        self.flash_attn_varlen_func: Callable[..., Any] | None = getattr(hub_module, "flash_attn_varlen_func", None)
         if self.flash_attn_func is None and self.flash_attn_varlen_func is None:
             raise RuntimeError("Failed to load flash-attn2 kernel from HuggingFace Hub: no functions found")
 
@@ -117,7 +137,7 @@ class FlashAttentionHubImpl(AttentionImpl):
         if attn_func is not None:
             return self._unwrap_flash_output(attn_func(q, k, v, **kwargs))
         return _run_varlen_dense(
-            self.flash_attn_varlen_func,
+            _require_varlen_func(self.flash_attn_varlen_func),
             q,
             k,
             v,
@@ -144,7 +164,7 @@ class FlashAttentionHubImpl(AttentionImpl):
             query, key, value, attention_mask, query_length, _unpad_input
         )
 
-        out_unpad = self.flash_attn_varlen_func(
+        out_unpad = _require_varlen_func(self.flash_attn_varlen_func)(
             q,
             k,
             v,
@@ -167,7 +187,7 @@ class FlashAttentionHubImpl(AttentionImpl):
         value: torch.Tensor,
     ) -> torch.Tensor:
         return _run_varlen_dense(
-            self.flash_attn_varlen_func,
+            _require_varlen_func(self.flash_attn_varlen_func),
             query,
             key,
             value,
@@ -180,7 +200,7 @@ class FlashAttentionHubImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_metadata: AttentionMetadata = None,
+        attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
@@ -200,6 +220,7 @@ class FlashAttentionHubImpl(AttentionImpl):
                 full_attn_spans,
                 self.softmax_scale,
                 attn_func,
+                query_ranges=None if attn_metadata is None else attn_metadata.query_ranges,
             )
 
         if attention_mask is not None and torch.any(~attention_mask):
@@ -229,9 +250,11 @@ class FlashAttentionHubImpl(AttentionImpl):
 
 class FlashAttention3HubBackend(AttentionBackend):
     accept_output_buffer: bool = True
+    supports_piecewise_spans: bool = True
 
     @classmethod
-    def supports_attention_mask(cls) -> bool:
+    def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
+        del attention_spec
         return True
 
     @staticmethod
@@ -247,7 +270,7 @@ class FlashAttention3HubBackend(AttentionBackend):
         return FlashAttention3HubImpl
 
 
-class FlashAttention3HubImpl(AttentionImpl):
+class FlashAttention3HubImpl(AttentionImpl[AttentionMetadata]):
     def __init__(
         self,
         num_heads: int,
@@ -267,23 +290,9 @@ class FlashAttention3HubImpl(AttentionImpl):
         if backend_kwargs:
             logger.warning("FlashAttention3HubImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
 
-        # Lazily get the kernel from the Hub to avoid network/disk overhead on import
-        from kernels import get_kernel
-
-        logger.info("Loading flash-attn3 kernel from HuggingFace Hub...")
-        try:
-            hub_module = get_kernel("kernels-community/flash-attn3", version=1)
-        except Exception as e:
-            try:
-                logger.info("Failed to load version 1, attempting version 2: %s", e)
-                hub_module = get_kernel("kernels-community/flash-attn3", version=2)
-            except Exception as e2:
-                logger.info("Failed to load version 2, attempting default: %s", e2)
-                hub_module = get_kernel("kernels-community/flash-attn3")
-
-        self.flash_attn_func = getattr(hub_module, "flash_attn_func", None)
-        self.flash_attn_varlen_func = getattr(hub_module, "flash_attn_varlen_func", None)
-
+        hub_module = _get_hub_module("kernels-community/flash-attn3")
+        self.flash_attn_func: Callable[..., Any] | None = getattr(hub_module, "flash_attn_func", None)
+        self.flash_attn_varlen_func: Callable[..., Any] | None = getattr(hub_module, "flash_attn_varlen_func", None)
         if self.flash_attn_func is None and self.flash_attn_varlen_func is None:
             raise RuntimeError("Failed to load flash-attn3 kernel from HuggingFace Hub: no functions found")
 
@@ -296,7 +305,7 @@ class FlashAttention3HubImpl(AttentionImpl):
         if attn_func is not None:
             return self._unwrap_flash_output(attn_func(q, k, v, **kwargs))
         return _run_varlen_dense(
-            self.flash_attn_varlen_func,
+            _require_varlen_func(self.flash_attn_varlen_func),
             q,
             k,
             v,
@@ -323,7 +332,7 @@ class FlashAttention3HubImpl(AttentionImpl):
             query, key, value, attention_mask, query_length, _unpad_input
         )
 
-        out_unpad = self.flash_attn_varlen_func(
+        out_unpad = _require_varlen_func(self.flash_attn_varlen_func)(
             q,
             k,
             v,
@@ -346,7 +355,7 @@ class FlashAttention3HubImpl(AttentionImpl):
         value: torch.Tensor,
     ) -> torch.Tensor:
         return _run_varlen_dense(
-            self.flash_attn_varlen_func,
+            _require_varlen_func(self.flash_attn_varlen_func),
             query,
             key,
             value,
@@ -359,7 +368,7 @@ class FlashAttention3HubImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_metadata: AttentionMetadata = None,
+        attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
@@ -379,6 +388,7 @@ class FlashAttention3HubImpl(AttentionImpl):
                 full_attn_spans,
                 self.softmax_scale,
                 attn_func,
+                query_ranges=None if attn_metadata is None else attn_metadata.query_ranges,
             )
 
         if attention_mask is not None and torch.any(~attention_mask):

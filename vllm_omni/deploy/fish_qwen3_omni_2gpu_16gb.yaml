@@ -1,4 +1,4 @@
-# Fish Speech S2 Pro 2-GPU deploy: 2x16G VRAM 优化版本
+# Fish Speech S2 Pro 2-GPU deploy: 2x16G VRAM Version
 #
 # Fish Speech S2 Pro 2-GPU deploy: Stage0 AR on GPU 0, Stage1 DAC on GPU 1.
 #
@@ -37,7 +37,7 @@ connectors:
 stages:
   - stage_id: 0
     max_num_seqs: 64
-    gpu_memory_utilization: 0.85
+    gpu_memory_utilization: 0.9
     enforce_eager: false
     async_scheduling: false
     # vLLM scheduler requires max_num_batched_tokens >= max_model_len when

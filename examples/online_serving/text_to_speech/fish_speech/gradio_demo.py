@@ -580,10 +580,10 @@ def create_app(api_base: str):
                 ),
                 stream=True,
             )
-        except Exception as exc:
+        except Exception:
             logger.exception("Proxy connection error")
             await client.aclose()
-            return Response(content=str(exc), status_code=502)
+            return Response(content="Proxy connection failed", status_code=502)
 
         if resp.status_code != 200:
             content = await resp.aread()

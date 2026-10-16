@@ -8,6 +8,10 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def _payload_store_class(clock=time):
     path = Path(__file__).resolve().parents[2] / "examples/online_serving/text_to_speech/fish_speech/gradio_demo.py"

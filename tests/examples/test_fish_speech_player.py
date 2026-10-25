@@ -5,6 +5,7 @@ import ast
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -12,8 +13,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_worklet_completion_requires_clean_end():
-    node = shutil.which("node")
-    if node is None:
+    node = shutil.which("node") or ""
+    if not node:
         pytest.skip("node is required for browser protocol tests")
     demo = Path(__file__).resolve().parents[2] / "examples/online_serving/text_to_speech/fish_speech/gradio_demo.py"
     module = ast.parse(demo.read_text())
@@ -68,12 +69,12 @@ assert.equal(messages.some(m => m.type === 'ended'), false);
 def test_player_initialization_and_terminal_states():
     import json
 
-    node = shutil.which("node")
-    if node is None:
+    node = shutil.which("node") or ""
+    if not node:
         pytest.skip("node is required for browser protocol tests")
     demo = Path(__file__).resolve().parents[2] / "examples/online_serving/text_to_speech/fish_speech/gradio_demo.py"
     module = ast.parse(demo.read_text())
-    statements = [
+    statements: list[ast.stmt] = [
         stmt
         for stmt in module.body
         if (isinstance(stmt, ast.FunctionDef) and stmt.name == "_build_player_js")
@@ -82,7 +83,7 @@ def test_player_initialization_and_terminal_states():
             and any(isinstance(target, ast.Name) and target.id == "WORKLET_JS" for target in stmt.targets)
         )
     ]
-    namespace = {"json": json}
+    namespace: dict[str, Any] = {"json": json}
     exec(compile(ast.Module(body=statements, type_ignores=[]), str(demo), "exec"), namespace)
     script = namespace["_build_player_js"](44100).replace("<script>", "").replace("</script>", "")
     harness = r"""
@@ -143,6 +144,9 @@ function setup() {
     stopped.sandbox.window.ttsStop(); stopped.resolve(); await pending;
     assert.equal(stopped.requests.length,0);
     assert.equal(stopped.elements['tts-status'].textContent,'Stopped');
+    // Turning streaming off resets the player status instead of reporting a user stop.
+    stopped.sandbox.window.ttsStop('Ready');
+    assert.equal(stopped.elements['tts-status'].textContent,'Ready');
 
     s.sandbox.fetch = async () => new Response(new ReadableStream({
         start(c) {c.enqueue(new Uint8Array([1,0]));setTimeout(() => c.error(new Error('stream failed')),10);}

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Gradio demo for Fish Speech S2 Pro online serving via /v1/audio/speech API.
 
 Streaming uses a custom AudioWorklet-based player for gap-free playback,
@@ -6,6 +9,9 @@ vLLM server through a same-origin proxy and played via the Web Audio API's
 AudioWorklet, which maintains a FIFO buffer queue and plays samples at the
 audio clock rate — eliminating the inter-chunk gaps inherent in Gradio's
 built-in streaming audio component.
+AudioWorklet requires a secure context (HTTPS or localhost). When the demo is
+opened over plain HTTP from another machine, streaming falls back to Gradio's
+chunked gr.Audio player; use an SSH tunnel to localhost for gapless playback.
 
 Supports:
   - Text-to-speech synthesis
@@ -224,12 +230,12 @@ def _build_player_js(sample_rate: int) -> str:
         }}
     }}
 
-    window.ttsStop = function() {{
+    window.ttsStop = function(status) {{
         const stoppedGeneration = ++generation;
         if (abort) abort.abort();
         if (node) node.port.postMessage({{ type: 'clear', token: stoppedGeneration }});
         gen = false;
-        setStatus('Stopped', '#999');
+        setStatus(status || 'Stopped', '#999');
         const btn = document.getElementById('tts-stop-btn');
         if (btn) btn.style.display = 'none';
     }};
@@ -484,6 +490,61 @@ def generate_speech(api_base: str, text: str, ref_audio, ref_audio_url, ref_text
         raise gr.Error(f"Failed to decode audio: {e}")
 
 
+def generate_speech_stream(api_base, text, ref_audio, ref_audio_url, ref_text, response_format, chunk_seconds=0.5):
+    """Streaming: yield PCM chunks for progressive playback."""
+    payload = build_payload(text, ref_audio, ref_audio_url, ref_text, response_format, stream=True)
+
+    min_chunk_samples = int(PCM_SAMPLE_RATE * chunk_seconds)
+    prebuffer_chunks = 2
+    pending: list[np.ndarray] = []
+    pending_len = 0
+    chunks_yielded = 0
+    prebuffer: list[np.ndarray] = []
+
+    try:
+        leftover = b""
+        with httpx.Client(timeout=300.0) as client:
+            with client.stream(
+                "POST",
+                f"{api_base}/v1/audio/speech",
+                json=payload,
+                headers={"Content-Type": "application/json", "Authorization": "Bearer EMPTY"},
+            ) as resp:
+                if resp.status_code != 200:
+                    resp.read()
+                    raise gr.Error(f"Server error ({resp.status_code}): {resp.text}")
+                for chunk in resp.iter_bytes():
+                    if not chunk:
+                        continue
+                    raw = leftover + chunk
+                    usable = len(raw) - (len(raw) % 2)
+                    leftover = raw[usable:]
+                    if usable == 0:
+                        continue
+                    float_samples = np.frombuffer(raw[:usable], dtype=np.int16).copy().astype(np.float32) / 32767.0
+                    pending.append(float_samples)
+                    pending_len += len(float_samples)
+                    if pending_len >= min_chunk_samples:
+                        audio_chunk = np.concatenate(pending)
+                        pending.clear()
+                        pending_len = 0
+                        if chunks_yielded < prebuffer_chunks:
+                            prebuffer.append(audio_chunk)
+                            chunks_yielded += 1
+                            if chunks_yielded == prebuffer_chunks:
+                                yield (PCM_SAMPLE_RATE, np.concatenate(prebuffer))
+                                prebuffer.clear()
+                        else:
+                            yield (PCM_SAMPLE_RATE, audio_chunk)
+        remaining = prebuffer + pending
+        if remaining:
+            yield (PCM_SAMPLE_RATE, np.concatenate(remaining))
+    except httpx.TimeoutException:
+        raise gr.Error("Request timed out. The server may be busy.")
+    except httpx.ConnectError:
+        raise gr.Error(f"Cannot connect to server at {api_base}. Is the server running?")
+
+
 class PayloadStore:
     """Thread-safe, single-consumer store for payloads handed to the browser."""
 
@@ -653,9 +714,9 @@ def create_app(api_base: str):
                         scale=1,
                     )
                     stream_checkbox = gr.Checkbox(
-                        label="Stream output (gapless)",
+                        label="Stream output",
                         value=False,
-                        info="AudioWorklet streaming",
+                        info="Gapless on HTTPS/localhost, chunked otherwise",
                         scale=1,
                     )
 
@@ -673,6 +734,13 @@ def create_app(api_base: str):
                     autoplay=True,
                     visible=True,
                 )
+                stream_audio = gr.Audio(
+                    label="Generated Audio (streaming)",
+                    interactive=False,
+                    streaming=True,
+                    autoplay=True,
+                    visible=False,
+                )
                 gr.Markdown(
                     "### About\n"
                     "- **Fish Speech S2 Pro** by FishAudio: 4B dual-AR model\n"
@@ -684,51 +752,79 @@ def create_app(api_base: str):
         # Hidden textbox to pass the streaming payload from Python -> JavaScript.
         hidden_payload = gr.Textbox(visible=False, elem_id="tts-payload")
 
-        def on_stream_change(stream: bool):
-            """Lock format to PCM when streaming; swap player vs gr.Audio."""
+        # AudioWorklet only exists in secure contexts (HTTPS or localhost), so plain-HTTP
+        # remote access uses the chunked gr.Audio fallback. Each event's js fills this
+        # hidden input in the browser, so there is no page-load race.
+        worklet_ok = gr.Checkbox(value=False, visible=False)
+        worklet_js = "!!(window.isSecureContext && window.AudioWorkletNode)"
+
+        def on_stream_change(stream: bool, worklet: bool):
+            """Lock format to PCM when streaming; show the matching output component."""
             if stream:
                 return (
                     gr.update(value="pcm", interactive=False),
-                    gr.update(visible=True),  # player_html
+                    gr.update(visible=worklet),  # player_html
                     gr.update(visible=False),  # audio_output
+                    gr.update(visible=not worklet),  # stream_audio
                 )
             return (
                 gr.update(value="wav", interactive=True),
                 gr.update(visible=False),
                 gr.update(visible=True),
+                gr.update(visible=False),
             )
-
-        stream_checkbox.change(
-            fn=on_stream_change,
-            inputs=[stream_checkbox],
-            outputs=[response_format, player_html, audio_output],
-        )
 
         all_inputs = [text_input, ref_audio, ref_audio_url, ref_text, response_format]
 
-        def on_generate(stream_enabled, *args):
+        def on_generate(stream_enabled, worklet, *args):
             # Streaming path: build payload in Python, stash it, hand the
             # browser a short request id. The .then() JS calls window.ttsGenerate
             # which fetches /proxy and feeds PCM into the AudioWorklet player.
-            if stream_enabled:
+            if stream_enabled and worklet:
                 text, ref_a, ref_url, ref_t, _fmt = args
                 payload = build_payload(text, ref_a, ref_url, ref_t, "pcm", stream=True)
                 req_id = payload_store.store(payload)
                 browser_payload = {"_req_id": req_id}
                 return json.dumps(browser_payload), gr.update()
+            if stream_enabled:
+                return "", gr.update()  # handled by on_stream_fallback
             # Non-streaming path: return the full clip via gr.Audio.
             audio = generate_speech(api_base, *args)
             return "", audio
 
+        def on_stream_fallback(stream_enabled, worklet, *args):
+            # Separate event so the streaming gr.Audio never sees a non-streaming run.
+            if stream_enabled and not worklet:
+                yield from generate_speech_stream(api_base, *args)
+
+        generate_inputs = [stream_checkbox, worklet_ok] + all_inputs
+        generate_js = f"(...a) => {{ a[1] = {worklet_js}; return a; }}"
         generate_btn.click(
             fn=on_generate,
-            inputs=[stream_checkbox] + all_inputs,
+            inputs=generate_inputs,
             outputs=[hidden_payload, audio_output],
+            js=generate_js,
         ).then(
             fn=lambda p: p,
             inputs=[hidden_payload],
             outputs=[hidden_payload],
             js="(p) => { if (p && p.trim()) { const d = JSON.parse(p); delete d._nonce; window.ttsGenerate(d); } return p; }",
+        )
+        fallback_event = generate_btn.click(
+            fn=on_stream_fallback,
+            inputs=generate_inputs,
+            outputs=[stream_audio],
+            js=generate_js,
+        )
+
+        # Turning streaming off cancels any active stream so it cannot overlap
+        # the next non-streaming result.
+        stream_checkbox.change(
+            fn=on_stream_change,
+            inputs=[stream_checkbox, worklet_ok],
+            outputs=[response_format, player_html, audio_output, stream_audio],
+            js=f"(s, _w) => {{ if (!s && window.ttsStop) window.ttsStop('Ready'); return [s, {worklet_js}]; }}",
+            cancels=[fallback_event],
         )
 
         demo.queue()

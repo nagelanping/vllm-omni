@@ -760,18 +760,19 @@ def create_app(api_base: str):
 
         def on_stream_change(stream: bool, worklet: bool):
             """Lock format to PCM when streaming; show the matching output component."""
+            # Clear both gr.Audio values so autoplay cannot replay an old clip when shown again.
             if stream:
                 return (
                     gr.update(value="pcm", interactive=False),
                     gr.update(visible=worklet),  # player_html
-                    gr.update(visible=False),  # audio_output
-                    gr.update(visible=not worklet),  # stream_audio
+                    gr.update(value=None, visible=False),  # audio_output
+                    gr.update(value=None, visible=not worklet),  # stream_audio
                 )
             return (
                 gr.update(value="wav", interactive=True),
                 gr.update(visible=False),
-                gr.update(visible=True),
-                gr.update(visible=False),
+                gr.update(value=None, visible=True),
+                gr.update(value=None, visible=False),
             )
 
         all_inputs = [text_input, ref_audio, ref_audio_url, ref_text, response_format]
@@ -799,12 +800,13 @@ def create_app(api_base: str):
 
         generate_inputs = [stream_checkbox, worklet_ok] + all_inputs
         generate_js = f"(...a) => {{ a[1] = {worklet_js}; return a; }}"
-        generate_btn.click(
+        generate_event = generate_btn.click(
             fn=on_generate,
             inputs=generate_inputs,
             outputs=[hidden_payload, audio_output],
             js=generate_js,
-        ).then(
+        )
+        generate_event.then(
             fn=lambda p: p,
             inputs=[hidden_payload],
             outputs=[hidden_payload],
@@ -817,14 +819,14 @@ def create_app(api_base: str):
             js=generate_js,
         )
 
-        # Turning streaming off cancels any active stream so it cannot overlap
-        # the next non-streaming result.
+        # Switching modes cancels in-flight generations so neither a stream nor a
+        # late non-streaming result can land in a hidden player and replay later.
         stream_checkbox.change(
             fn=on_stream_change,
             inputs=[stream_checkbox, worklet_ok],
             outputs=[response_format, player_html, audio_output, stream_audio],
             js=f"(s, _w) => {{ if (!s && window.ttsStop) window.ttsStop('Ready'); return [s, {worklet_js}]; }}",
-            cancels=[fallback_event],
+            cancels=[generate_event, fallback_event],
         )
 
         demo.queue()

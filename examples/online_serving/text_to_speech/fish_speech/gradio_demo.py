@@ -807,10 +807,11 @@ def create_app(api_base: str):
             js=generate_js,
         )
         generate_event.then(
-            fn=lambda p: p,
-            inputs=[hidden_payload],
+            fn=lambda p, _s: p,
+            inputs=[hidden_payload, stream_checkbox],
             outputs=[hidden_payload],
-            js="(p) => { if (p && p.trim()) { const d = JSON.parse(p); delete d._nonce; window.ttsGenerate(d); } return p; }",
+            # Re-check the mode: a toggle between on_generate and this callback is not covered by `cancels`.
+            js="(p, s) => { if (s && p && p.trim()) { const d = JSON.parse(p); delete d._nonce; window.ttsGenerate(d); } return [p, s]; }",
         )
         fallback_event = generate_btn.click(
             fn=on_stream_fallback,
